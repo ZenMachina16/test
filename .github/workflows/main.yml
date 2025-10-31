@@ -1,0 +1,158 @@
+name: CI/CD for JavaScript Application
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: 'Git ref (commit, tag, or branch) to deploy for rollback'
+        required: false
+        default: 'main'
+
+jobs:
+  build_and_test:
+    name: Build, Test & Scan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Cache node_modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-modules-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-modules-
+
+      - name: Install dependencies with retry
+        run: |
+          for i in 1 2 3; do
+            npm ci && exit 0 || echo "npm ci failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "npm ci failed after 3 attempts" && exit 1
+
+      - name: Check for package.json scripts
+        id: check_scripts
+        run: |
+          if npm pkg get scripts.build >/dev/null 2>&1; then
+            echo "build_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_exists=false" >> $GITHUB_OUTPUT
+          fi
+          if npm pkg get scripts.test >/dev/null 2>&1; then
+            echo "test_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "test_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Initialize CodeQL Security Scan
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'javascript'
+
+      - name: Run build script (if it exists)
+        if: steps.check_scripts.outputs.build_exists == 'true'
+        run: npm run build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run test script (if it exists)
+        if: steps.check_scripts.outputs.test_exists == 'true'
+        run: npm test
+
+      - name: Perform Security Vulnerability Scan (npm audit)
+        run: npm audit --audit-level=high
+
+      - name: Upload build artifact
+        if: success() && steps.check_scripts.outputs.build_exists == 'true' && matrix.node-version == 20
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: |
+            dist/
+            build/
+          if-no-files-found: warn
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Production
+    needs: build_and_test
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    environment:
+      name: production
+      url: https://test.example.com
+
+    steps:
+      - name: Determine Git Ref to Deploy
+        id: get_ref
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "ref=${{ github.event.inputs.git_ref }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout specific ref for deployment/rollback
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.get_ref.outputs.ref }}
+
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: production
+          ref: ${{ steps.get_ref.outputs.ref }}
+          description: 'Deploying to production environment'
+          initial_status: 'in_progress'
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: ./deploy-package
+        continue-on-error: true
+
+      - name: Deploy to target environment
+        run: |
+          echo "Starting deployment of ref: ${{ steps.get_ref.outputs.ref }}"
+          if [ -d "./deploy-package" ] && [ "$(ls -A ./deploy-package)" ]; then
+            echo "Deploying from build artifact..."
+            ls -R ./deploy-package
+          else
+            echo "No build artifact found. Deploying from source."
+          fi
+          # This is a placeholder for your actual deployment script.
+          # Example: aws s3 sync ./deploy-package s3://my-bucket --delete
+          sleep 10 # Simulate deployment time
+          echo "Deployment complete!"
+
+      - name: Update deployment status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: "${{ job.status }}"
+          description: "Deployment status: ${{ job.status }}"
+          environment_url: ${{ job.environment.url }}
