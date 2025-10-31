@@ -1,0 +1,178 @@
+name: Node.js CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  deployments: write
+  actions: read
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Check for package.json scripts
+        id: check_scripts
+        shell: bash
+        run: |
+          if [ -f package.json ]; then
+            echo "test_script_exists=$(jq -r '.scripts.test != null' package.json)" >> $GITHUB_OUTPUT
+            echo "build_script_exists=$(jq -r '.scripts.build != null' package.json)" >> $GITHUB_OUTPUT
+          else
+            echo "test_script_exists=false" >> $GITHUB_OUTPUT
+            echo "build_script_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Dependencies with Retry
+        shell: bash
+        run: |
+          for i in {1..3}; do
+            npm ci && break
+            echo "npm ci failed. Retrying in 10 seconds..."
+            sleep 10
+          done
+
+      - name: Run Security Audit (NPM)
+        run: npm audit --audit-level=high
+
+      - name: Run Tests
+        if: steps.check_scripts.outputs.test_script_exists == 'true'
+        run: npm test
+
+      - name: Run Build
+        if: steps.check_scripts.outputs.build_script_exists == 'true'
+        id: build_step
+        run: npm run build
+
+      - name: Upload Build Artifact
+        if: steps.build_step.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-${{ matrix.node-version }}
+          path: |
+            dist/
+            build/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  security_scan:
+    name: CodeQL Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  deploy:
+    name: Deploy to Production
+    needs: [build, security_scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://your-app-url.com # Change this to your deployment URL
+
+    steps:
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false,
+              description: 'Deploying to production'
+            });
+            core.setOutput('deployment_id', deployment.id);
+            return deployment;
+
+      - name: Download Build Artifact (Node 20.x)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-20.x
+          path: ./deployment-package
+
+      - name: Deploy Logic
+        id: deploy_logic
+        run: |
+          echo "Starting deployment of contents from ./deployment-package"
+          # Add your actual deployment commands here
+          # Example: aws s3 sync ./deployment-package s3://your-bucket
+          echo "Deployment simulation successful!"
+          # On failure, exit with a non-zero code:
+          # exit 1
+
+      - name: Update Deployment Status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const state = '${{ job.status }}' === 'success' ? 'success' : 'failure';
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.deployment_id }},
+              state: state,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              environment_url: 'https://your-app-url.com' // Change this
+            });
+
+  handle_deployment_failure:
+    name: Handle Deployment Failure
+    needs: deploy
+    if: failure() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report Failure
+        run: echo "Deployment to production failed for commit ${{ github.sha }}."
+
+      - name: Initiate Rollback (Placeholder)
+        run: |
+          echo "Initiating rollback procedures..."
+          # Add your rollback script/commands here
+          # Example: aws deploy create-deployment --application-name MyApp --deployment-group-name MyDeploymentGroup --revision '{"revisionType":"S3","s3Location":{"bucket":"my-bucket","key":"previous-revision.zip","bundleType":"zip"}}'
+          echo "Rollback logic would execute here."
