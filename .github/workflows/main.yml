@@ -1,0 +1,227 @@
+```yaml
+name: CI/CD Pipeline for JavaScript Application
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      rollback_run_id:
+        description: 'ID of the successful workflow run to rollback to. (Find this on the Actions tab)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache Node Modules
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install Dependencies with Retry
+        shell: bash
+        run: |
+          for i in {1..3}; do
+            npm ci && break
+            echo "npm ci failed. Retrying in 15 seconds... (Attempt $i of 3)"
+            sleep 15
+          done
+
+      - name: Check for Test and Build Scripts
+        id: check_scripts
+        shell: bash
+        run: |
+          if grep -q '"test":' package.json; then
+            echo "test_script_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "test_script_exists=false" >> $GITHUB_OUTPUT
+          fi
+          if grep -q '"build":' package.json; then
+            echo "build_script_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "build_script_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Tests
+        if: steps.check_scripts.outputs.test_script_exists == 'true'
+        run: npm test
+
+      - name: Run Build
+        if: steps.check_scripts.outputs.build_script_exists == 'true'
+        run: npm run build
+
+      - name: Upload Build Artifact
+        if: steps.check_scripts.outputs.build_script_exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ matrix.node-version }}
+          path: |
+            dist/
+            build/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+      - name: Scan for secrets with TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.before }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://your-app-url.com # Replace with your actual URL
+
+    steps:
+      - name: Create GitHub Deployment (pending)
+        uses: actions/github-script@v7
+        id: create_deployment
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false,
+              description: 'Deploying to production'
+            });
+            core.setOutput('deployment_id', deployment.id);
+
+      - name: Download Artifact (Node 18.x)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-18.x
+          path: ./deployment-package
+
+      - name: Deploy to Production
+        id: deploy_step
+        # This is a placeholder. Replace with your deployment commands (e.g., to AWS S3, Vercel, etc.)
+        # Add retry logic here for network-dependent commands.
+        run: |
+          echo "Deploying files from ./deployment-package to production..."
+          # Example: aws s3 sync ./deployment-package s3://your-bucket-name --delete
+          sleep 5 # Simulating deployment time
+          echo "Deployment successful!"
+
+      - name: Update GitHub Deployment Status (success/failure)
+        uses: actions/github-script@v7
+        if: always() # Run this step even if the deployment fails
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const deployment_id = ${{ steps.create_deployment.outputs.deployment_id }};
+            const state = '${{ job.status }}' === 'success' ? 'success' : 'failure';
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment_id,
+              state: state,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              environment_url: 'https://your-app-url.com' // Replace with your URL
+            });
+
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_run_id != ''
+    environment:
+      name: production
+    steps:
+      - name: Notify of Rollback
+        run: echo "Attempting to roll back to deployment from workflow run: ${{ github.event.inputs.rollback_run_id }}"
+
+      - name: Download Artifact from Previous Run
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: ${{ github.workflow }}
+          run_id: ${{ github.event.inputs.rollback_run_id }}
+          name: build-artifacts-18.x # Assuming 18.x is the primary build
+          path: ./rollback-package
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Perform Rollback Deployment
+        # Replace with your actual rollback/deployment commands
+        run: |
+          echo "Deploying files from ./rollback-package to production..."
+          # Example: aws s3 sync ./rollback-package s3://your-bucket-name --delete
+          echo "Rollback deployment complete."
+
+      - name: Create GitHub Issue and Comment on Rollback
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const run_id = '${{ github.event.inputs.rollback_run_id }}';
+            const run_url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${run_id}`;
+            const actor = '${{ github.actor }}';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Production Rollback Initiated by ${actor}`,
+              body: `A manual rollback was triggered to restore the production deployment from workflow run [${run_id}](${run_url}). Please verify system stability.`,
+              labels: ['production', 'rollback']
+            });
+```
