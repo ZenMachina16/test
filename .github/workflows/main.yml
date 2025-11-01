@@ -1,0 +1,177 @@
+```yaml
+name: CI-CD Pipeline for test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of the successful deployment to rollback to'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20.x'
+  NPM_CACHE_DIR: '~/.npm'
+  ARTIFACT_NAME: 'build-artifact'
+
+jobs:
+  ci:
+    name: Build, Test, and Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache Node Modules
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NPM_CACHE_DIR }}
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Check for available scripts in package.json
+        id: check_scripts
+        run: |
+          if jq -e '.scripts.test' package.json > /dev/null; then echo "test_script_exists=true" >> $GITHUB_OUTPUT; fi
+          if jq -e '.scripts.build' package.json > /dev/null; then echo "build_script_exists=true" >> $GITHUB_OUTPUT; fi
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'javascript'
+
+      - name: Install Dependencies with Retry
+        uses: nick-invision/retry@v3
+        with:
+          timeout_seconds: 120
+          max_attempts: 3
+          command: npm ci --cache ${{ env.NPM_CACHE_DIR }} --prefer-offline
+
+      - name: Run Security Scan on Dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+      - name: Run Tests
+        if: steps.check_scripts.outputs.test_script_exists == 'true'
+        run: npm test
+
+      - name: Run Build
+        if: steps.check_scripts.outputs.build_script_exists == 'true'
+        run: npm run build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Upload Build Artifact
+        if: steps.check_scripts.outputs.build_script_exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            dist/
+            build/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  deploy:
+    name: Deploy to Production
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://myapp.example.com 
+    
+    steps:
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: production
+          initial_status: in_progress
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ./dist
+      
+      # Placeholder for actual deployment logic (e.g., to AWS, Vercel, Azure)
+      # This step should contain your deployment commands
+      - name: Deploy to Cloud Provider
+        run: |
+          echo "Starting deployment..."
+          # Example: aws s3 sync ./dist s3://my-production-bucket
+          sleep 10 # Simulating deployment time
+          echo "Deployment simulated successfully."
+
+      - name: Update Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: ${{ job.status }}
+          environment_url: https://myapp.example.com
+
+  rollback:
+    name: Rollback Production
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Create GitHub Deployment for Rollback
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: production
+          initial_status: in_progress
+          description: "Rolling back to a previous version from Run ID ${{ github.event.inputs.run_id }}"
+
+      # Placeholder for actual rollback logic
+      - name: Execute Rollback
+        run: |
+          echo "Initiating rollback procedure for Run ID: ${{ github.event.inputs.run_id }}"
+          echo "This step should contain your rollback logic."
+          echo "For example: find artifact from the specified run ID, and redeploy it."
+          # Example: aws deploy create-deployment --application-name MyApp --deployment-group-name MyDeploymentGroup --s3-location bucket=my-bucket,key=previous-version.zip,bundleType=zip
+          sleep 10 # Simulating rollback time
+          echo "Rollback simulated successfully."
+
+      - name: Update Rollback Deployment Status
+        if: always()
+        uses: chrnorm/deployment-status@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: ${{ job.status }}
+          description: "Rollback completed."
+```
