@@ -1,0 +1,274 @@
+```yaml
+name: CI/CD Pipeline for JavaScript Application
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      rollback_target:
+        description: 'Commit SHA or Tag to roll back to. Leave empty to use the last successful commit on main.'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20.x'
+  ARTIFACT_NAME: 'build-artifact'
+
+jobs:
+  test_and_scan:
+    name: Test & Security Scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache Node Modules
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+
+      - name: Install Dependencies with Retry
+        run: |
+          for i in 1 2 3; do
+            npm ci && break || sleep 15
+          done
+
+      - name: Check for Available Scripts
+        id: check_scripts
+        run: |
+          echo "test=$(jq -r '.scripts.test | if . then "true" else "false" end' package.json)" >> $GITHUB_OUTPUT
+          echo "build=$(jq -r '.scripts.build | if . then "true" else "false" end' package.json)" >> $GITHUB_OUTPUT
+
+      - name: Run Security Audit
+        run: npm audit --audit-level=high
+
+      - name: Run Tests
+        if: steps.check_scripts.outputs.test == 'true'
+        run: npm test
+
+      - name: Initialize CodeQL
+        if: matrix.node-version == env.NODE_VERSION # Run security scans only on the primary Node version
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'javascript'
+
+      - name: Autobuild
+        if: steps.codeql.outputs.codeql-was-run == 'true'
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        if: steps.codeql.outputs.codeql-was-run == 'true'
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run Trivy Vulnerability Scanner
+        if: matrix.node-version == env.NODE_VERSION
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: matrix.node-version == env.NODE_VERSION
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build:
+    name: Build Application
+    needs: test_and_scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache Node Modules
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Check for Build Script
+        id: check_build_script
+        run: |
+          echo "build_exists=$(jq -r '.scripts.build | if . then "true" else "false" end' package.json)" >> $GITHUB_OUTPUT
+
+      - name: Run Build
+        if: steps.check_build_script.outputs.build_exists == 'true'
+        run: npm run build
+
+      - name: Prepare Artifact
+        run: |
+          # This step prepares the necessary files for the artifact.
+          # If a build script creates a 'dist' or 'build' folder, we use that.
+          # Otherwise, we package the whole application.
+          if [ -d "dist" ]; then
+            mkdir -p artifact/dist && cp -r dist/. artifact/dist
+          elif [ -d "build" ]; then
+            mkdir -p artifact/build && cp -r build/. artifact/build
+          fi
+          # Always include package files and node_modules for runtime
+          mkdir -p artifact/node_modules
+          cp -r node_modules/. artifact/node_modules
+          cp package.json package-lock.json index.js artifact/
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifact/
+
+  deploy:
+    name: Deploy to Production
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://your-app-url.com # Replace with your actual deployment URL
+
+    steps:
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: actions/create-deployment@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          environment: production
+          required_contexts: '[]'
+          description: 'Deploying to production environment'
+          transient_environment: true
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ./app
+
+      - name: Deploy with Retry
+        id: deploy_step
+        run: |
+          for i in 1 2 3; do
+            echo "Attempting deployment (attempt $i)..."
+            # Replace the following line with your actual deployment command
+            # For example: scp -r ./app user@host:/path/to/app || exit 1
+            echo "Simulating deployment of files in ./app" && sleep 5 && exit 0
+            echo "Deployment failed on attempt $i. Retrying in 15 seconds..."
+            sleep 15
+          done
+          echo "Deployment failed after 3 attempts."
+          exit 1
+
+      - name: Update Deployment Status to Success
+        if: success()
+        uses: actions/update-deployment-status@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'success'
+          environment_url: ${{ job.environment.url }}
+
+      - name: Update Deployment Status to Failure
+        if: failure()
+        uses: actions/update-deployment-status@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: 'failure'
+          environment_url: ${{ job.environment.url }}
+
+  rollback:
+    name: Rollback Production
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Find Last Successful Commit
+        id: get_sha
+        if: github.event.inputs.rollback_target == ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'main.yml',
+              branch: 'main',
+              status: 'success',
+              event: 'push',
+            });
+            const lastSuccessfulCommit = runs.data.workflow_runs[0].head_sha;
+            console.log(`Last successful commit SHA: ${lastSuccessfulCommit}`);
+            core.setOutput('sha', lastSuccessfulCommit);
+
+      - name: Set Target Commit SHA
+        id: set_target
+        run: |
+          if [ -n "${{ github.event.inputs.rollback_target }}" ]; then
+            echo "sha=${{ github.event.inputs.rollback_target }}" >> $GITHUB_OUTPUT
+          else
+            echo "sha=${{ steps.get_sha.outputs.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout Rollback Commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.set_target.outputs.sha }}
+
+      - name: Informative Rollback Notice
+        run: |
+          echo "==========================================================="
+          echo "Initiating Rollback to commit: ${{ steps.set_target.outputs.sha }}"
+          echo "This job should now re-build and re-deploy this specific commit."
+          echo "Replace the steps below with your actual build and deploy logic for the rollback."
+          echo "==========================================================="
+
+      - name: Setup Node.js for Rollback
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Dependencies for Rollback
+        run: npm ci
+
+      - name: Perform Rollback Deployment
+        run: |
+          echo "Simulating rollback deployment..."
+          # Add your actual rollback deployment commands here
+          sleep 10
+          echo "Rollback deployment complete."
+```
