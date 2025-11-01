@@ -1,0 +1,206 @@
+```yaml
+# .github/workflows/main.yml
+name: CI/CD Pipeline for JavaScript Application
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+  security-events: write
+  deployments: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'javascript'
+          queries: +security-and-quality
+
+      - name: Install dependencies for analysis
+        run: npm ci
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run NPM Audit
+        run: npm audit --audit-level=high
+
+  build-and-test:
+    name: Build & Test
+    needs: security-scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        id: npm-cache
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-
+            ${{ runner.os }}-
+
+      - name: Install dependencies with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_seconds: 600
+          max_attempts: 3
+          retry_on: error
+          command: npm ci
+
+      - name: Check for available scripts
+        id: check_scripts
+        run: |
+          echo "test_exists=$(jq -r '.scripts.test != null' package.json)" >> $GITHUB_OUTPUT
+          echo "build_exists=$(jq -r '.scripts.build != null' package.json)" >> $GITHUB_OUTPUT
+
+      - name: Run tests
+        if: steps.check_scripts.outputs.test_exists == 'true'
+        run: npm test
+
+      - name: Run build
+        if: steps.check_scripts.outputs.build_exists == 'true'
+        run: npm run build
+
+      - name: Upload build artifact
+        if: steps.check_scripts.outputs.build_exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-${{ matrix.node-version }}-${{ github.sha }}
+          path: |
+            dist/
+            build/
+          if-no-files-found: ignore
+
+  deploy:
+    name: Deploy to Production
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://example.com # Replace with your deployment URL
+    steps:
+      - name: Create GitHub Deployment
+        id: create_deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false,
+              description: 'Deploying to production environment'
+            });
+            core.setOutput('deployment_id', deployment.id);
+            return deployment;
+
+      - name: Update deployment status to 'in_progress'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create_deployment.outputs.deployment_id }},
+              state: 'in_progress',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              environment_url: 'https://example.com'
+            });
+
+      - name: Download build artifact (Node 20.x)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-20.x-${{ github.sha }}
+          path: ./deployment-package
+
+      - name: Deploy to production environment
+        run: |
+          echo "🚀 Starting deployment to production..."
+          # Add your deployment commands here.
+          # Example: aws s3 sync ./deployment-package s3://my-production-bucket
+          echo "✅ Deployment simulation successful."
+
+      - name: Update deployment status on success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create_deployment.outputs.deployment_id }},
+              state: 'success',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              environment_url: 'https://example.com'
+            });
+
+      - name: Update deployment status on failure
+        if: failure() || cancelled()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create_deployment.outputs.deployment_id }},
+              state: 'failure',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+  rollback:
+    name: Automatic Rollback
+    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Notify about rollback
+        run: echo "🚨 Deployment failed! Initiating automatic rollback."
+
+      - name: Execute rollback script
+        run: |
+          echo "Executing rollback procedure..."
+          # This is a placeholder for your rollback logic.
+          # Example:
+          # 1. Get the SHA of the last successful deployment from the GitHub API.
+          # 2. Download the artifact associated with that SHA.
+          # 3. Deploy the old artifact.
+          echo "✅ Rollback simulation complete. The previous version should be live."
+
+```
