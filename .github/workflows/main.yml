@@ -1,0 +1,202 @@
+```yaml
+name: CI/CD Pipeline for JavaScript Application
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA to rollback to (for rollback job)'
+        required: false
+
+jobs:
+  build:
+    name: Build and Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache Node Modules
+        id: npm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+
+      - name: Install Dependencies with Retry
+        run: |
+          for i in 1 2 3; do
+            npm ci && exit 0 || sleep 15
+          done
+          echo "::error::Failed to install dependencies after 3 attempts."
+          exit 1
+        shell: bash
+
+      - name: Run Tests (if script exists)
+        if: success()
+        run: |
+          if npm run test --if-present; then
+            echo "Tests passed."
+          else
+            echo "::error::Tests failed."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Run Build (if script exists)
+        if: success()
+        run: npm run build --if-present
+
+      - name: Upload Build Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-node-${{ matrix.node-version }}
+          path: |
+            dist/
+            node_modules/
+            package.json
+            package-lock.json
+            index.js
+          retention-days: 7
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run Trivy vulnerability scanner in repo mode
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://your-app-url.com # Replace with your actual URL
+
+    steps:
+      - name: Create GitHub Deployment
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          environment: production
+          initial_status: in_progress
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-node-20.x # Assuming 20.x is the primary build for deployment
+
+      - name: Deploy to Production Server
+        # This is a placeholder for your actual deployment commands.
+        # Examples: scp, rsync, aws s3 sync, kubectl apply, etc.
+        run: |
+          echo "Deploying application..."
+          # Example: rsync -avz . user@your-server:/path/to/app
+          sleep 10 # Simulating deployment delay
+          echo "Deployment successful!"
+        continue-on-error: false
+
+      - name: Update Deployment Status
+        uses: chrnorm/deployment-status-action@v2
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: "${{ job.status }}"
+          environment_url: https://your-app-url.com
+
+  rollback:
+    name: Manual Rollback
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.commit_sha != ''
+    environment:
+      name: production
+
+    steps:
+      - name: Create GitHub Rollback Deployment
+        id: deployment
+        uses: chrnorm/deployment-action@v2
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          environment: production
+          ref: ${{ github.event.inputs.commit_sha }}
+          initial_status: in_progress
+          description: "Manual rollback to ${{ github.event.inputs.commit_sha }}"
+
+      - name: Checkout code at specified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_sha }}
+
+      - name: Execute Rollback
+        # This is a placeholder for your actual rollback logic.
+        # This might involve deploying the older code version,
+        # or running a script on your server.
+        run: |
+          echo "Rolling back to commit ${{ github.event.inputs.commit_sha }}..."
+          # Example: rsync -avz --delete . user@your-server:/path/to/app
+          sleep 10 # Simulating rollback
+          echo "Rollback to ${{ github.event.inputs.commit_sha }} complete."
+        continue-on-error: false
+
+      - name: Update Deployment Status for Rollback
+        uses: chrnorm/deployment-status-action@v2
+        with:
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          state: "${{ job.status }}"
+          description: "Rollback to ${{ github.event.inputs.commit_sha }} was ${{ job.status }}."
+
+```
