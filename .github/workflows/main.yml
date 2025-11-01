@@ -1,0 +1,249 @@
+```yaml
+name: CI/CD Pipeline for JavaScript Application
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID of the successful workflow run to rollback to'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript' ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: +security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build-and-test:
+    name: Build & Test
+    needs: []
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        id: npm-cache
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+
+      - name: Install dependencies with retry
+        run: |
+          for i in 1 2 3; do
+            npm ci && break
+            echo "npm ci failed. Retrying in 15 seconds..."
+            sleep 15
+          done
+
+      - name: Run npm audit for security vulnerabilities
+        run: npm audit --audit-level=high
+
+      - name: Run tests if 'test' script exists
+        if: "jq -e '.scripts.test' package.json > /dev/null"
+        run: npm test
+
+      - name: Run build if 'build' script exists
+        if: "jq -e '.scripts.build' package.json > /dev/null"
+        run: npm run build
+
+      - name: Upload build artifact
+        if: "jq -e '.scripts.build' package.json > /dev/null"
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-node-${{ matrix.node-version }}
+          path: |
+            dist/
+            build/
+          if-no-files-found: ignore
+
+  deploy:
+    name: Deploy to Production
+    needs: [build-and-test, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://test.example.com
+    steps:
+      - name: Create GitHub Deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false,
+              description: 'Deploying to production'
+            });
+            core.setOutput('deployment_id', deployment.id);
+      - name: Download build artifact (from Node 20.x build)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact-node-20.x
+          path: ./deployment-package
+
+      - name: Deploy to target
+        run: |
+          echo "Deploying files from ./deployment-package to production server..."
+          # Add your actual deployment script here (e.g., rsync, scp, aws s3 sync)
+          sleep 10 # Simulating deployment time
+          echo "Deployment successful."
+
+      - name: Update Deployment Status (Success)
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.deployment_id }},
+              state: 'success',
+              environment_url: 'https://test.example.com',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deployment to production succeeded.'
+            });
+
+      - name: Update Deployment Status (Failure)
+        if: failure() || cancelled()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.deployment_id }},
+              state: 'failure',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Deployment to production failed.'
+            });
+
+  rollback:
+    name: Manual Rollback
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - name: Create Rollback Deployment
+        id: create-rollback-deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: deployment } = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.ref,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false,
+              description: `Rollback to run ID: ${{ github.event.inputs.run_id }}`
+            });
+            core.setOutput('deployment_id', deployment.id);
+
+      - name: Download artifact from previous successful run
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: ${{ github.workflow }}
+          run_id: ${{ github.event.inputs.run_id }}
+          name: build-artifact-node-20.x
+          path: ./rollback-package
+          if_no_artifact_found: fail
+
+      - name: Deploy rollback artifact
+        run: |
+          echo "Deploying files from ./rollback-package to production server..."
+          # Add your actual deployment script here for the rollback
+          sleep 10
+          echo "Rollback deployment successful."
+
+      - name: Update Rollback Deployment Status (Success)
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-rollback-deployment.outputs.deployment_id }},
+              state: 'success',
+              environment_url: 'https://test.example.com',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Rollback to run ${{ github.event.inputs.run_id }} succeeded.'
+            });
+
+      - name: Update Rollback Deployment Status (Failure)
+        if: failure() || cancelled()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-rollback-deployment.outputs.deployment_id }},
+              state: 'failure',
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Rollback to run ${{ github.event.inputs.run_id }} failed.'
+            });
+```
