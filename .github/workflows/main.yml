@@ -70,7 +70,7 @@ jobs:
           npm audit --audit-level=high || true
 
       - name: Run Snyk Scan (if configured)
-        if: secrets.SNYK_TOKEN != ''
+        if: env.SNYK_TOKEN != ''
         continue-on-error: true
         run: |
           echo "::notice::SNYK_TOKEN found, running Snyk scan."
