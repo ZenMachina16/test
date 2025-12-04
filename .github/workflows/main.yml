@@ -1,0 +1,179 @@
+name: CI/CD Pipeline for JavaScript/TypeScript
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      rollback_target:
+        description: 'ID of the previous successful run or commit SHA to roll back to'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [ '18.x', '20.x' ]
+    outputs:
+      artifact_id: ${{ steps.upload_artifact.outputs.artifact-id }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+
+      - name: Install dependencies with retries
+        run: |
+          n=0
+          until [ "$n" -ge 3 ]
+          do
+            if [ -f package-lock.json ]; then
+              echo "::notice::package-lock.json found. Using 'npm ci'."
+              npm ci && break
+            else
+              echo "::notice::package-lock.json not found. Using 'npm install'."
+              npm install && break
+            fi
+            n=$((n+1))
+            echo "::warning::Dependency installation failed. Retrying in 15 seconds..."
+            sleep 15
+          done
+          if [ "$n" -ge 3 ]; then
+            echo "::error::Failed to install dependencies after 3 attempts."
+            exit 1
+          fi
+
+      - name: Run security audit
+        run: |
+          echo "::notice::Running 'npm audit'. This step will not fail the build."
+          npm audit --audit-level=high || true
+
+      - name: Run Snyk Scan (if configured)
+        if: secrets.SNYK_TOKEN != ''
+        continue-on-error: true
+        run: |
+          echo "::notice::SNYK_TOKEN found, running Snyk scan."
+          npm install -g snyk
+          snyk test --all-projects
+
+      - name: Run Tests (if script exists)
+        id: test
+        run: |
+          if npm pkg get scripts.test > /dev/null 2>&1; then
+            echo "::notice::'test' script found in package.json. Running tests..."
+            npm test
+          else
+            echo "::notice::No 'test' script found in package.json, skipping."
+          fi
+
+      - name: Run Build (if script exists)
+        id: build
+        run: |
+          if npm pkg get scripts.build > /dev/null 2>&1; then
+            echo "::notice::'build' script found in package.json. Running build..."
+            npm run build
+            echo "ran_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::No 'build' script found in package.json, skipping."
+            echo "ran_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload build artifact
+        if: steps.build.outputs.ran_build == 'true'
+        id: upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: |
+            dist
+            build
+            .next
+          if-no-files-found: warn
+          retention-days: 14
+
+  deploy:
+    name: Deploy to Production
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.result == 'success'
+
+    steps:
+      - name: Check for build artifact
+        id: check_artifact
+        run: |
+          if [ -z "${{ needs.build.outputs.artifact_id }}" ]; then
+            echo "::notice::No build artifact was uploaded from the build job. Skipping deployment."
+            echo "can_deploy=false" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Build artifact found. Proceeding with deployment."
+            echo "can_deploy=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download build artifact
+        if: steps.check_artifact.outputs.can_deploy == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: ./deployment-package
+
+      - name: Simulate Deployment
+        if: steps.check_artifact.outputs.can_deploy == 'true'
+        run: |
+          echo "::notice::Deploying to production environment..."
+          echo "Contents of the deployment package:"
+          ls -R ./deployment-package
+          echo "Deployment simulation complete."
+
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_target != ''
+
+    steps:
+      - name: Log rollback information
+        run: |
+          echo "::notice::Starting rollback procedure."
+          echo "Target specified: ${{ github.event.inputs.rollback_target }}"
+          echo "Attempting to find and download the latest successful 'build-artifact' from the 'main' branch."
+
+      - name: Download latest successful artifact for rollback
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: build-artifact
+          path: ./rollback-package
+          workflow: main.yml
+          branch: main
+          workflow_conclusion: success
+          if_no_artifact_found: warn
+
+      - name: Simulate Rollback Deployment
+        run: |
+          if [ -d "./rollback-package" ] && [ "$(ls -A ./rollback-package)" ]; then
+            echo "::notice::Artifact found. Simulating rollback deployment..."
+            echo "Contents of the rollback package:"
+            ls -R ./rollback-package
+            echo "Rollback simulation complete."
+          else
+            echo "::warning::No suitable previous artifact found to perform a rollback. Skipping deployment."
+          fi
