@@ -1,3 +1,181 @@
+# name: CI/CD Pipeline
+
+# on:
+#   push:
+#     branches: [ main ]
+#   pull_request:
+#     branches: [ main ]
+#   workflow_dispatch:
+#     inputs:
+#       rollback_target:
+#         description: 'Commit SHA, tag, or ref for rollback (e.g., a1b2c3d). Leave empty for normal run.'
+#         required: false
+#         default: ''
+
+# permissions:
+#   contents: read
+#   packages: write
+
+
+# jobs:
+#   build:
+#     name: Build & Test
+#     runs-on: ubuntu-latest
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         node-version: [20.x]
+#     outputs:
+#       artifact_produced: ${{ steps.check_scripts.outputs.has_build }}
+
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v4
+
+#       - name: Setup Node.js ${{ matrix.node-version }}
+#         uses: actions/setup-node@v4
+#         with:
+#           node-version: ${{ matrix.node-version }}
+
+#       - name: Cache npm dependencies
+#         uses: actions/cache@v4
+#         with:
+#           path: ~/.npm
+#           key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ hashFiles('**/package-lock.json') }}
+#           restore-keys: |
+#             ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
+#         continue-on-error: true
+
+#       - name: Install dependencies with retries
+#         run: |
+#           ATTEMPTS=3
+#           DELAY=5
+#           for i in $(seq 1 $ATTEMPTS); do
+#             if [ -f package-lock.json ]; then
+#               npm ci && break
+#             else
+#               npm install && break
+#             fi
+#             if [ "$i" -lt "$ATTEMPTS" ]; then
+#               echo "Attempt $i failed. Retrying in $DELAY seconds..."
+#               sleep $DELAY
+#             else
+#               echo "::error::Failed to install dependencies after $ATTEMPTS attempts."
+#               exit 1
+#             fi
+#           done
+
+#       - name: Run Security Audit
+#         run: |
+#           echo "Running lightweight security audit..."
+#           npm audit --audit-level=high || true
+
+#       - name: Check for available package.json scripts
+#         id: check_scripts
+#         run: |
+#           if npm pkg get scripts.test > /dev/null 2>&1; then
+#             echo "has_test=true" >> "$GITHUB_OUTPUT"
+#             echo "Test script found in package.json."
+#           else
+#             echo "has_test=false" >> "$GITHUB_OUTPUT"
+#             echo "No test script found, skipping tests."
+#           fi
+#           if npm pkg get scripts.build > /dev/null 2>&1; then
+#             echo "has_build=true" >> "$GITHUB_OUTPUT"
+#             echo "Build script found in package.json."
+#           else
+#             echo "has_build=false" >> "$GITHUB_OUTPUT"
+#             echo "No build script found, skipping build."
+#           fi
+
+#       - name: Run tests
+#         if: steps.check_scripts.outputs.has_test == 'true'
+#         run: |
+#           npm test
+
+#       - name: Run build
+#         if: steps.check_scripts.outputs.has_build == 'true'
+#         run: |
+#           npm run build
+
+#       - name: Upload build artifact
+#         if: steps.check_scripts.outputs.has_build == 'true'
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: build-artifact
+#           path: |
+#             dist
+#             build
+#             .next
+#           if-no-files-found: warn
+
+#   deploy:
+#     name: Deploy to Production
+#     needs: build
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.artifact_produced == 'true'
+#     runs-on: ubuntu-latest
+#     permissions:
+#       contents: read
+#       deployments: write
+
+#     steps:
+#       - name: Download build artifact
+#         uses: actions/download-artifact@v4
+#         with:
+#           name: build-artifact
+#           path: ./deploy-package
+
+#       - name: Check for artifact and deploy
+#         run: |
+#           if [ -d "./deploy-package" ] && [ "$(ls -A ./deploy-package)" ]; then
+#             echo "Build artifact found. Simulating deployment..."
+#             ls -R ./deploy-package
+#             echo "Deployment simulation complete."
+#           else
+#             echo "::warning::Deployment was triggered, but no build artifact was downloaded successfully. Skipping deploy."
+#           fi
+
+#   log_skipped_deploy:
+#     name: Log Skipped Deploy
+#     needs: build
+#     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.outputs.artifact_produced != 'true'
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Log skip message
+#         run: |
+#           echo "Build step did not produce an artifact. Skipping deployment."
+
+#   rollback:
+#     name: Rollback Production
+#     if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback_target != ''
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Log rollback target
+#         run: |
+#           echo "Attempting to roll back to artifact from commit/ref: ${{ github.event.inputs.rollback_target }}"
+
+#       - name: Find and Download Previous Artifact
+#         uses: dawidd6/action-download-artifact@v3
+#         with:
+#           workflow: ${{ github.workflow }}
+#           commit: ${{ github.event.inputs.rollback_target }}
+#           name: build-artifact
+#           path: ./rollback-package
+#         continue-on-error: true
+
+#       - name: Check for artifact and perform rollback
+#         run: |
+#           if [ -d "./rollback-package" ] && [ "$(ls -A ./rollback-package)" ]; then
+#             echo "Previous build artifact found. Simulating rollback deployment..."
+#             ls -R ./rollback-package
+#             echo "Rollback simulation complete."
+#           else
+#             echo "Could not find a build artifact for the specified target: '${{ github.event.inputs.rollback_target }}'."
+#             echo "Skipping rollback deployment."
+#           fi
+
+
+
 name: CI/CD Pipeline
 
 on:
@@ -15,7 +193,6 @@ on:
 permissions:
   contents: read
   packages: write
-
 
 jobs:
   build:
@@ -98,6 +275,26 @@ jobs:
         run: |
           npm run build
 
+      # 🔹 NEW: Login + build + push Docker image to GHCR
+      - name: Log in to GitHub Container Registry
+        if: steps.check_scripts.outputs.has_build == 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Docker image
+        if: steps.check_scripts.outputs.has_build == 'true'
+        run: |
+          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ github.sha }}
+          echo "Building Docker image $IMAGE_NAME"
+          docker build -t "$IMAGE_NAME" .
+
+      - name: Push Docker image
+        if: steps.check_scripts.outputs.has_build == 'true'
+        run: |
+          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ github.sha }}
+          echo "Pushing Docker image $IMAGE_NAME"
+          docker push "$IMAGE_NAME"
+
       - name: Upload build artifact
         if: steps.check_scripts.outputs.has_build == 'true'
         uses: actions/upload-artifact@v4
@@ -173,3 +370,4 @@ jobs:
             echo "Could not find a build artifact for the specified target: '${{ github.event.inputs.rollback_target }}'."
             echo "Skipping rollback deployment."
           fi
+
