@@ -9,7 +9,7 @@ const generateCustomers = () => {
     customers.push({
       id: i + 1,
       name: `Customer Name`,
-      phone: `+917600000001`,
+      phone: `+917600600001`,
       email: `john.doe@gmail.com`,
       score: 23,
       lastMessageAt: 'July 12 2024, 12:45 PM',
