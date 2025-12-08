@@ -10,7 +10,7 @@ const generateCustomers = () => {
       id: i + 1,
       name: `Customer Name`,
       phone: `+917600600001`,
-      email: `john.doe@gmail.com`,
+      email: `doe.john@gmail.com`,
       score: 23,
       lastMessageAt: 'July 22 2024, 12:45 PM',
       addedBy: 'Kartikey Mishra',
