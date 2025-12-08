@@ -12,7 +12,7 @@ const generateCustomers = () => {
       phone: `+917600600001`,
       email: `john.doe@gmail.com`,
       score: 23,
-      lastMessageAt: 'July 12 2024, 12:45 PM',
+      lastMessageAt: 'July 22 2024, 12:45 PM',
       addedBy: 'Kartikey Mishra',
       avatar: 'https://via.placeholder.com/40'
     });
